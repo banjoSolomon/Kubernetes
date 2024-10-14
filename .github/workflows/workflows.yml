@@ -1,21 +1,145 @@
-# Sample workflow
-name: CI
+name: Build, Push to Docker Hub, and Deploy to Minikube with PostgreSQL
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    branches:
+      - in-dev
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-    - name: Set up JDK 17
-      uses: actions/setup-java@v2
-      with:
-        java-version: '17'
-    - name: Build with Maven
-      run: mvn -B package --file pom.xml
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v2
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: maven
+
+
+      - name: Restore Maven dependencies
+        uses: actions/cache@v2
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+
+      - name: Build Docker image
+        run: docker build -t solomon11/kuba:latest .
+
+
+      - name: Push Docker image to Docker Hub
+        run: docker push solomon11/kuba:latest
+
+
+      - name: Check and install kubectl
+        run: |
+          if ! command -v kubectl &> /dev/null
+          then
+            echo "kubectl not found. Installing..."
+            sudo apt-get update -y
+            sudo apt-get install -y kubectl
+          else
+            echo "kubectl is already installed."
+          fi
+
+
+      - name: Deploy PostgreSQL to Kubernetes
+        run: |
+          kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgres-service
+          spec:
+            ports:
+              - port: 5432
+            selector:
+              app: postgres
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: postgres
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: postgres
+            template:
+              metadata:
+                labels:
+                  app: postgres
+              spec:
+                containers:
+                - name: postgres
+                  image: postgres:13
+                  ports:
+                  - containerPort: 5432
+                  env:
+                  - name: POSTGRES_USER
+                    value: "postgres"
+                  - name: POSTGRES_PASSWORD
+                    value: "Solomon11"
+                  - name: POSTGRES_DB
+                    value: "dev_db"
+          EOF
+
+
+      - name: Deploy application to Kubernetes
+        run: |
+          kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: kuba-app
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: kuba-app
+            template:
+              metadata:
+                labels:
+                  app: kuba-app
+              spec:
+                containers:
+                - name: kuba-app
+                  image: solomon11/kuba:latest
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: SPRING_DATASOURCE_URL
+                    value: "jdbc:postgresql://postgres-service:5432/dev_db"
+                  - name: SPRING_DATASOURCE_USERNAME
+                    value: "postgres"
+                  - name: SPRING_DATASOURCE_PASSWORD
+                    value: "Solomon11"
+                  imagePullPolicy: Always
+          EOF
+
+
+      - name: Expose application via NodePort
+        run: |
+          kubectl expose deployment kuba-app --type=NodePort --port=8080 || true
+
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/kuba-app
+          kubectl get pods
